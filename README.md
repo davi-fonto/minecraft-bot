@@ -16,5 +16,5 @@ Uso
 
 Note
 
-- Il bot usa `minecraft-server-util` per interrogare lo stato del server.
+- Il bot usa `mcstatus` tramite script python per interrogare lo stato del server.
 - Un server è considerato in manutenzione se il motd contiene le parole "manutenzione" o "maintenance" (case-insensitive).
