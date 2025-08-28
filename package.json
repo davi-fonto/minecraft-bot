@@ -1,0 +1,18 @@
+{
+  "name": "minecraft-monitor-bot",
+  "version": "1.0.0",
+  "description": "Discord bot che monitora lo stato di server Minecraft via IP e aggiorna un embed in tempo reale.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+  "discord.js": "^14.11.0",
+  "dotenv": "^16.0.0",
+  "node-fetch": "^2.6.7",
+  "sharp": "^0.32.4",
+  "web-streams-polyfill": "^3.2.1"
+  }
+}
