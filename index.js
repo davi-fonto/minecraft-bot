@@ -26,8 +26,153 @@ if (!TOKEN) {
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages], partials: [Partials.Channel] });
 
-// map messageId -> interval
+// map messageId -> entry
 const monitoringMap = new Map();
+
+const fs = require('fs');
+const MONITORS_FILE = path.join(__dirname, 'monitors.json');
+
+async function saveMonitorsToDisk() {
+  try {
+    const arr = [];
+    for (const [id, entry] of monitoringMap.entries()) {
+      // store minimal info to restore: messageId, channelId, ip, ownerId, stopped
+      const channelId = entry.message?.channel?.id || entry.message?.channelId || null;
+      arr.push({ messageId: id, channelId, ip: entry.ip, ownerId: entry.ownerId, stopped: !!entry.stopped });
+    }
+    await fs.promises.writeFile(MONITORS_FILE, JSON.stringify(arr, null, 2), 'utf8');
+  } catch (e) {
+    console.error('Failed to save monitors to disk:', e);
+  }
+}
+
+async function loadMonitorsFromDisk() {
+  try {
+    if (!fs.existsSync(MONITORS_FILE)) return;
+    const raw = await fs.promises.readFile(MONITORS_FILE, 'utf8');
+    const arr = JSON.parse(raw || '[]');
+    for (const item of arr) {
+      try {
+        if (!item.messageId || !item.channelId || !item.ip) continue;
+  const channel = await client.channels.fetch(item.channelId).catch(() => null);
+  // some channel objects across versions may not expose isText(); check that we can fetch messages
+  if (!channel || typeof channel.messages?.fetch !== 'function') continue;
+        const msg = await channel.messages.fetch(item.messageId).catch(() => null);
+        if (!msg) continue;
+        const entry = { interval: null, ownerId: item.ownerId, message: msg, ip: item.ip, stopped: !!item.stopped };
+        monitoringMap.set(msg.id, entry);
+        // ensure the message components use our encoded restart id and show Restart enabled
+        const stopButton = new ButtonBuilder().setCustomId('stop_monitor').setLabel('Stop').setStyle(ButtonStyle.Danger);
+        const restartButton = new ButtonBuilder().setCustomId(makeRestartId(item.ip)).setLabel('Restart').setStyle(ButtonStyle.Success).setDisabled(false);
+        const row = new ActionRowBuilder().addComponents(stopButton, restartButton);
+        try { await msg.edit({ components: [row] }); } catch (e) { /* ignore edit errors */ }
+        // if it wasn't stopped, (re)start monitoring
+        if (!entry.stopped) {
+          startMonitor(entry).catch(() => {});
+        }
+      } catch (e) {
+        // skip individual errors
+      }
+    }
+  } catch (e) {
+    console.error('Failed to load monitors from disk:', e);
+  }
+}
+
+async function startMonitor(entry) {
+  if (!entry || !entry.message || !entry.ip) return;
+  // if interval exists, clear it first
+  try { if (entry.interval) clearInterval(entry.interval); } catch (e) {}
+  entry.stopped = false;
+  const stopButton = new ButtonBuilder().setCustomId('stop_monitor').setLabel('Stop').setStyle(ButtonStyle.Danger);
+  const restartButton = new ButtonBuilder().setCustomId(makeRestartId(entry.ip)).setLabel('Restart').setStyle(ButtonStyle.Success).setDisabled(false);
+  const row = new ActionRowBuilder().addComponents(stopButton, restartButton);
+
+  // immediate update
+  try {
+    const info = await fetchStatus(entry.ip);
+    const embed = buildEmbed(entry.ip, info);
+    const editFiles = [];
+    if (info.iconBuffer) {
+      editFiles.push(new AttachmentBuilder(info.iconBuffer, { name: 'servericon.png' }));
+      embed.setThumbnail('attachment://servericon.png');
+    }
+    if (info.motd) {
+      const motdSvg = renderMotdToSvg(info.motd);
+      if (sharp) {
+        const motdPng = await sharp(motdSvg).png().toBuffer();
+        editFiles.push(new AttachmentBuilder(motdPng, { name: 'motd.png' }));
+        embed.setImage('attachment://motd.png');
+      } else {
+        editFiles.push(new AttachmentBuilder(motdSvg, { name: 'motd.svg' }));
+        embed.setImage('attachment://motd.svg');
+      }
+    }
+    try { await entry.message.edit({ embeds: [embed], components: [row], files: editFiles.length ? editFiles : undefined }); } catch (e) { /* ignore */ }
+  } catch (e) {
+    // ignore
+  }
+
+  const interval = setInterval(async () => {
+    if (entry.stopped) return;
+    const info = await fetchStatus(entry.ip);
+    const embed = buildEmbed(entry.ip, info);
+    const editFiles = [];
+    if (info.iconBuffer) {
+      editFiles.push(new AttachmentBuilder(info.iconBuffer, { name: 'servericon.png' }));
+      embed.setThumbnail('attachment://servericon.png');
+    }
+    if (info.motd) {
+      const motdSvg = renderMotdToSvg(info.motd);
+      if (sharp) {
+        const motdPng = await sharp(motdSvg).png().toBuffer();
+        editFiles.push(new AttachmentBuilder(motdPng, { name: 'motd.png' }));
+        embed.setImage('attachment://motd.png');
+      } else {
+        editFiles.push(new AttachmentBuilder(motdSvg, { name: 'motd.svg' }));
+        embed.setImage('attachment://motd.svg');
+      }
+    }
+    try {
+      await entry.message.edit({ embeds: [embed], components: [row], files: editFiles.length ? editFiles : undefined });
+    } catch (e) {
+      console.error('Failed to edit message, stopping updates', e);
+      entry.stopped = true;
+      clearInterval(interval);
+      // enable restart button
+      const disabledStop = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('stop_monitor').setLabel('Stop').setStyle(ButtonStyle.Danger).setDisabled(true),
+        new ButtonBuilder().setCustomId(makeRestartId(entry.ip)).setLabel('Restart').setStyle(ButtonStyle.Success).setDisabled(false)
+      );
+      try { await entry.message.edit({ components: [disabledStop] }); } catch (_) {}
+      await saveMonitorsToDisk();
+    }
+  }, Math.max(5, UPDATE_SECONDS) * 1000);
+  entry.interval = interval;
+  await saveMonitorsToDisk();
+}
+
+// Helper to encode/decode restart button ids so the bot can resume monitors
+function makeRestartId(ip) {
+  try {
+    const b64 = Buffer.from(ip, 'utf8').toString('base64');
+    return `restart_monitor:${b64}`;
+  } catch (e) {
+    return 'restart_monitor';
+  }
+}
+
+function parseRestartId(customId) {
+  if (!customId) return null;
+  if (customId === 'restart_monitor') return null;
+  if (!customId.startsWith('restart_monitor:')) return null;
+  const [, b64] = customId.split(':');
+  try {
+    return Buffer.from(b64, 'base64').toString('utf8');
+  } catch (e) {
+    return null;
+  }
+}
 
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
@@ -54,6 +199,8 @@ client.once('ready', async () => {
     await client.application.commands.set(data);
     console.log('Registered global command');
   }
+  // attempt to restore monitors from disk
+  setImmediate(() => { loadMonitorsFromDisk().catch(() => {}); });
 });
 
 async function fetchStatus(host) {
@@ -218,19 +365,48 @@ function renderMotdToSvg(motd) {
 
 client.on('interactionCreate', async (interaction) => {
   try {
+    // safe reply helper to handle expired/unknown interactions
+    async function safeReply(interaction, options) {
+      try {
+        // convert deprecated ephemeral option to flags if present
+        if (options && typeof options === 'object' && options.ephemeral) {
+          options = Object.assign({}, options);
+          options.flags = 64; // EPHEMERAL
+          delete options.ephemeral;
+        }
+        if (interaction.deferred || interaction.replied) {
+          return await interaction.editReply(options).catch(async (e) => {
+            // if edit fails, fallback to channel send
+            try { return await interaction.channel.send(options); } catch (_) { return null; }
+          });
+        }
+        return await interaction.reply(options).catch(async (err) => {
+          // handle Unknown interaction (expired)
+          if (err?.code === 10062) {
+            try { return await interaction.channel.send(options); } catch (_) { return null; }
+          }
+          throw err;
+        });
+      } catch (e) {
+        // emit but don't crash
+        console.error('safeReply error:', e?.message || e);
+        return null;
+      }
+    }
+
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === 'monitor') {
         const member = interaction.member;
         const hasAdmin = member?.permissions?.has(PermissionsBitField.Flags.Administrator);
         if (!hasAdmin) {
-          return interaction.reply({ content: 'Solo gli amministratori possono usare questo comando.', ephemeral: true });
+          return safeReply(interaction, { content: 'Solo gli amministratori possono usare questo comando.', ephemeral: true });
         }
 
         const ip = interaction.options.getString('ip');
         await interaction.deferReply();
 
           const stopButton = new ButtonBuilder().setCustomId('stop_monitor').setLabel('Stop').setStyle(ButtonStyle.Danger);
-          const restartButton = new ButtonBuilder().setCustomId('restart_monitor').setLabel('Restart').setStyle(ButtonStyle.Success).setDisabled(true);
+          const restartButton = new ButtonBuilder().setCustomId(makeRestartId(ip)).setLabel('Restart').setStyle(ButtonStyle.Success).setDisabled(false);
           const row = new ActionRowBuilder().addComponents(stopButton, restartButton);
 
           // Initial render: attempt to get icon and motd attachments
@@ -264,43 +440,9 @@ client.on('interactionCreate', async (interaction) => {
 
           const entry = { interval: null, ownerId: interaction.user.id, message, ip, stopped: false };
 
-          const interval = setInterval(async () => {
-            if (entry.stopped) return;
-            const info = await fetchStatus(ip);
-            const embed = buildEmbed(ip, info);
-            const editFiles = [];
-            if (info.iconBuffer) {
-              editFiles.push(new AttachmentBuilder(info.iconBuffer, { name: 'servericon.png' }));
-              embed.setThumbnail('attachment://servericon.png');
-            }
-            if (info.motd) {
-              const motdSvg = renderMotdToSvg(info.motd);
-              if (sharp) {
-                const motdPng = await sharp(motdSvg).png().toBuffer();
-                editFiles.push(new AttachmentBuilder(motdPng, { name: 'motd.png' }));
-                embed.setImage('attachment://motd.png');
-              } else {
-                editFiles.push(new AttachmentBuilder(motdSvg, { name: 'motd.svg' }));
-                embed.setImage('attachment://motd.svg');
-              }
-            }
-            try {
-              await message.edit({ embeds: [embed], components: [row], files: editFiles.length ? editFiles : undefined });
-            } catch (err) {
-              console.error('Failed to edit message, stopping updates', err);
-              entry.stopped = true;
-              clearInterval(interval);
-              // enable restart button
-              const disabledStop = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('stop_monitor').setLabel('Stop').setStyle(ButtonStyle.Danger).setDisabled(true),
-                new ButtonBuilder().setCustomId('restart_monitor').setLabel('Restart').setStyle(ButtonStyle.Success).setDisabled(false)
-              );
-              try { await message.edit({ components: [disabledStop] }); } catch (_) {}
-            }
-          }, Math.max(5, UPDATE_SECONDS) * 1000);
-
-          entry.interval = interval;
+          // start monitoring using helper which also saves to disk
           monitoringMap.set(message.id, entry);
+          startMonitor(entry).catch(() => {});
       }
       return;
     }
@@ -309,41 +451,51 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.customId === 'stop_monitor') {
         const member = interaction.member;
         const hasAdmin = member?.permissions?.has(PermissionsBitField.Flags.Administrator);
-        if (!hasAdmin) return interaction.reply({ content: 'Solo gli amministratori possono fermare il monitor.', ephemeral: true });
+  if (!hasAdmin) return safeReply(interaction, { content: 'Solo gli amministratori possono fermare il monitor.', ephemeral: true });
 
         const messageId = interaction.message.id;
         const entry = monitoringMap.get(messageId);
-        if (!entry) return interaction.reply({ content: 'Monitor non trovato o già fermato.', ephemeral: true });
+  if (!entry) return safeReply(interaction, { content: 'Monitor non trovato o già fermato.', ephemeral: true });
 
-        try { if (entry.interval) clearInterval(entry.interval); } catch (e) {}
-        entry.stopped = true;
-        entry.interval = null;
+  try { if (entry.interval) clearInterval(entry.interval); } catch (e) {}
+  entry.stopped = true;
+  entry.interval = null;
 
         const disabledRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('stop_monitor').setLabel('Stop').setStyle(ButtonStyle.Danger).setDisabled(true),
-          new ButtonBuilder().setCustomId('restart_monitor').setLabel('Restart').setStyle(ButtonStyle.Success).setDisabled(false)
+          new ButtonBuilder().setCustomId(makeRestartId(entry.ip)).setLabel('Restart').setStyle(ButtonStyle.Success).setDisabled(false)
         );
         try {
           await entry.message.edit({ components: [disabledRow] });
         } catch (e) {
           // ignore
         }
-        return interaction.reply({ content: `Monitor per ${entry.ip} fermato.`, ephemeral: true });
+        await saveMonitorsToDisk();
+  return safeReply(interaction, { content: `Monitor per ${entry.ip} fermato.`, ephemeral: true });
       }
 
-      if (interaction.customId === 'restart_monitor') {
+  if (interaction.customId && interaction.customId.startsWith('restart_monitor')) {
         const member = interaction.member;
         const hasAdmin = member?.permissions?.has(PermissionsBitField.Flags.Administrator);
-        if (!hasAdmin) return interaction.reply({ content: 'Solo gli amministratori possono riavviare il monitor.', ephemeral: true });
+  if (!hasAdmin) return safeReply(interaction, { content: 'Solo gli amministratori possono riavviare il monitor.', ephemeral: true });
 
+        // The restart button's customId now encodes the target IP (restart_monitor:<base64(ip)>).
         const messageId = interaction.message.id;
-        const entry = monitoringMap.get(messageId);
-        if (!entry) return interaction.reply({ content: 'Monitor non trovato.', ephemeral: true });
-        if (!entry.stopped) return interaction.reply({ content: 'Il monitor è già attivo.', ephemeral: true });
+        let entry = monitoringMap.get(messageId);
+        // If we don't have an in-memory entry (bot restarted), try to recover IP from the button customId
+        if (!entry) {
+          const recoveredIp = parseRestartId(interaction.customId);
+          if (!recoveredIp) return safeReply(interaction, { content: 'Monitor non trovato.', ephemeral: true });
+          // create a placeholder entry so restart flow can proceed
+          entry = { interval: null, ownerId: interaction.user.id, message: interaction.message, ip: recoveredIp, stopped: true };
+          monitoringMap.set(interaction.message.id, entry);
+          await saveMonitorsToDisk();
+        }
+  if (!entry.stopped) return safeReply(interaction, { content: 'Il monitor è già attivo.', ephemeral: true });
 
-        // prepare buttons
-        const stopButton = new ButtonBuilder().setCustomId('stop_monitor').setLabel('Stop').setStyle(ButtonStyle.Danger);
-        const restartButton = new ButtonBuilder().setCustomId('restart_monitor').setLabel('Restart').setStyle(ButtonStyle.Success).setDisabled(true);
+  // prepare buttons (while active, restart is disabled)
+  const stopButton = new ButtonBuilder().setCustomId('stop_monitor').setLabel('Stop').setStyle(ButtonStyle.Danger);
+  const restartButton = new ButtonBuilder().setCustomId(makeRestartId(entry.ip)).setLabel('Restart').setStyle(ButtonStyle.Success).setDisabled(true);
         const row = new ActionRowBuilder().addComponents(stopButton, restartButton);
 
         // immediate update
@@ -351,14 +503,19 @@ client.on('interactionCreate', async (interaction) => {
           const info = await fetchStatus(entry.ip);
           const embed = buildEmbed(entry.ip, info);
           const editFiles = [];
-          if (info.iconBuffer) editFiles.push(new AttachmentBuilder(info.iconBuffer, { name: 'servericon.png' }));
+          if (info.iconBuffer) {
+            editFiles.push(new AttachmentBuilder(info.iconBuffer, { name: 'servericon.png' }));
+            embed.setThumbnail('attachment://servericon.png');
+          }
           if (info.motd) {
             const motdSvg = renderMotdToSvg(info.motd);
             if (sharp) {
               const motdPng = await sharp(motdSvg).png().toBuffer();
               editFiles.push(new AttachmentBuilder(motdPng, { name: 'motd.png' }));
+              embed.setImage('attachment://motd.png');
             } else {
               editFiles.push(new AttachmentBuilder(motdSvg, { name: 'motd.svg' }));
+              embed.setImage('attachment://motd.svg');
             }
           }
           await entry.message.edit({ embeds: [embed], components: [row], files: editFiles.length ? editFiles : undefined });
@@ -394,10 +551,16 @@ client.on('interactionCreate', async (interaction) => {
             console.error('Failed to edit on restart tick', e);
             entry.stopped = true;
             clearInterval(interval);
+            // if it fails again, enable restart button on the message so user can try again
+            const disabledStop = new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId('stop_monitor').setLabel('Stop').setStyle(ButtonStyle.Danger).setDisabled(true),
+              new ButtonBuilder().setCustomId(makeRestartId(entry.ip)).setLabel('Restart').setStyle(ButtonStyle.Success).setDisabled(false)
+            );
+            try { await entry.message.edit({ components: [disabledStop] }); } catch (_) {}
           }
         }, Math.max(5, UPDATE_SECONDS) * 1000);
         entry.interval = interval;
-        return interaction.reply({ content: `Monitor per ${entry.ip} riavviato.`, ephemeral: true });
+  return safeReply(interaction, { content: `Monitor per ${entry.ip} riavviato.`, ephemeral: true });
       }
     }
   } catch (err) {
